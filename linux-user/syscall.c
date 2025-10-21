@@ -815,6 +815,17 @@ safe_syscall4(int, fchmodat2, int, dfd, const char *, filename,
 #define safe_fcntl(...) safe_syscall(__NR_fcntl, __VA_ARGS__)
 #endif
 
+#ifndef NO_FUZZ_HOOKS
+static bool target_conn_recved = false;
+static int target_conn_fd = -1;
+static int target_sock_fd = -1;
+extern int fuzz_port;
+extern int bk_stdin_fd;
+extern int bk_stdout_fd;
+extern FILE *bk_stdin;
+extern FILE *bk_stdout;
+#endif
+
 static inline int host_to_target_sock_type(int host_type)
 {
     int target_type;
@@ -1372,8 +1383,28 @@ static abi_long do_select(int n,
         ts_ptr = NULL;
     }
 
+#ifndef NO_FUZZ_HOOKS
+    ret = 0;
+    if (target_sock_fd >= 0) {
+        for (int i = 0; i < n; ++i) {
+            if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
+                fprintf(bk_stdout, "[HOOK] select invoked on target socket\n");
+                ret = target_sock_fd + 1;
+                memset(&rfds, 0, sizeof(rfds));
+                memset(&wfds, 0, sizeof(wfds));
+                memset(&efds, 0, sizeof(efds));
+                FD_SET(target_sock_fd, &rfds);
+            }
+        }
+    }
+    if (!ret) {
+        ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr,
+                                  ts_ptr, NULL));
+    }
+#else
     ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr,
                                   ts_ptr, NULL));
+#endif
 
     if (!is_error(ret)) {
         if (rfd_addr && copy_to_user_fdset(rfd_addr, &rfds, n))
@@ -1500,8 +1531,28 @@ static abi_long do_pselect6(abi_long arg1, abi_long arg2, abi_long arg3,
         }
     }
 
+#ifndef NO_FUZZ_HOOKS
+    ret = 0;
+    if (target_sock_fd >= 0) {
+        for (int i = 0; i < n; ++i) {
+            if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
+                fprintf(bk_stdout, "[HOOK] select invoked on target socket\n");
+                ret = target_sock_fd + 1;
+                memset(&rfds, 0, sizeof(rfds));
+                memset(&wfds, 0, sizeof(wfds));
+                memset(&efds, 0, sizeof(efds));
+                FD_SET(target_sock_fd, &rfds);
+            }
+        }
+    }
+    if (!ret) {
+        ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr,
+                                  ts_ptr, sig_ptr));
+    }
+#else
     ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr,
                                   ts_ptr, sig_ptr));
+#endif
 
     if (sig_ptr) {
         finish_sigsuspend_mask(ret);
@@ -1588,9 +1639,24 @@ static abi_long do_ppoll(abi_long arg1, abi_long arg2, abi_long arg3,
             }
         }
 
+#ifndef NO_FUZZ_HOOKS
+        for (i = 0; i < nfds; i++) {
+            if (target_sock_fd >= 0 && pfd[i].fd == target_sock_fd) {
+                fprintf(bk_stdout, "[HOOK] poll invoked on target socket\n");
+                for (i = 0; i < nfds; i++) {
+                    if (pfd[i].fd == target_sock_fd) {
+                        pfd[i].revents = tswap16(POLLIN);
+                    } else {
+                        pfd[i].revents = 0;
+                    }
+                }
+                return 1;
+            }
+        }
+#else
         ret = get_errno(safe_ppoll(pfd, nfds, timeout_ts,
                                    set, SIGSET_T_SIZE));
-
+#endif
         if (set) {
             finish_sigsuspend_mask(ret);
         }
@@ -1721,6 +1787,18 @@ static inline abi_long target_to_host_sockaddr(int fd, struct sockaddr *addr,
         in6addr = (struct sockaddr_in6 *)addr;
         in6addr->sin6_scope_id = tswap32(in6addr->sin6_scope_id);
     }
+#ifndef NO_FUZZ_HOOKS
+    if (sa_family == AF_INET) {
+        struct sockaddr_in *inaddr;
+        int port;
+
+        inaddr = (struct sockaddr_in *)addr;
+        port = ntohs(inaddr->sin_port);
+        if (fuzz_port >= 0 && fuzz_port == port) {
+            target_sock_fd = fd;
+        }
+    }
+#endif
     unlock_user(target_saddr, target_addr, 0);
 
     return 0;
@@ -2591,6 +2669,13 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
     abi_long ret;
     int len, val;
     socklen_t lv;
+
+#ifndef NO_FUZZ_HOOKS
+    if(sockfd == target_conn_fd) {
+        fputs("[HOOK] hook getsockopt\n", bk_stdout);
+        return 0;
+    }
+#endif
 
     switch(level) {
     case TARGET_SOL_SOCKET:
@@ -3476,6 +3561,42 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
         host_flags |= SOCK_CLOEXEC;
     }
 
+#ifndef NO_FUZZ_HOOKS
+    // Hijack accepted connection to our fuzzing backend
+    struct sockaddr_in sin;
+    socklen_t len = sizeof(sin);
+    if (!getsockname(fd, (struct sockaddr *)&sin, &len)) {
+        if (ntohs(sin.sin_port) == fuzz_port) {
+            target_conn_fd = dup(bk_stdin_fd);
+            if (target_conn_fd < 0) {
+                return -TARGET_EMFILE;
+            }
+            fprintf(bk_stdout, "[HOOK] accept sock fd: %d\n", target_conn_fd);
+            if (target_conn_recved) {
+                fputs("[HOOK] done!\n", bk_stdout);
+                exit(0);
+            }
+        }
+
+        // Fake connection source to bypass checks
+        if (!get_user_u32(addrlen, target_addrlen_addr)) {
+            close(target_conn_fd);
+            return -TARGET_EFAULT;
+        }
+        struct sockaddr_in saddr = {0};
+        saddr.sin_family = AF_INET;
+        saddr.sin_port = htons(4444);
+        inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+        host_to_target_sockaddr(target_addr, (void *)&saddr, addrlen);
+        if (put_user_u32(addrlen, target_addrlen_addr)) {
+            close(target_conn_fd);
+            return -TARGET_EFAULT;
+        }
+        
+        return target_conn_fd;
+    }
+#endif
+
     if (target_addr == 0) {
         return get_errno(safe_accept4(fd, NULL, NULL, host_flags));
     }
@@ -3558,6 +3679,21 @@ static abi_long do_getsockname(int fd, abi_ulong target_addr,
 
     addr = alloca(addrlen);
 
+#ifndef NO_FUZZ_HOOKS
+    if (target_conn_fd >= 0 && fd == target_conn_fd) {
+        // Fake getsockname for our hooked socket
+        struct sockaddr_in saddr = {0};
+        fputs("[HOOK] getsockname invoked!\n", bk_stdout);
+        fprintf(bk_stdout, "getsockname fd: %d\n", fd);
+        saddr.sin_family = AF_INET;
+        saddr.sin_port = htons(80);
+        inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+        host_to_target_sockaddr(target_addr, (void *)&saddr, addrlen);
+        if (put_user_u32(addrlen, target_addrlen_addr)) return -TARGET_EFAULT;
+        return 0;
+    }
+#endif
+
     ret_addrlen = addrlen;
     ret = get_errno(getsockname(fd, addr, &ret_addrlen));
     if (!is_error(ret)) {
@@ -3603,6 +3739,18 @@ static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
     host_msg = lock_user(VERIFY_READ, msg, len, 1);
     if (!host_msg)
         return -TARGET_EFAULT;
+#ifndef NO_FUZZ_HOOKS
+    if (target_conn_fd >= 0 && fd == target_conn_fd) {
+        // Heuristic: assume data handling only send one response per connection
+        if (target_conn_recved) {
+            fputs("[HOOK] done in sendto!\n", bk_stdout);
+        }
+        // Hijack sendto to our fuzzing backend
+        ret = (abi_long) write(fd, host_msg, len);
+        unlock_user(host_msg, msg, len);
+        return len;
+    }
+#endif
     if (fd_trans_target_to_host_data(fd)) {
         copy_msg = host_msg;
         host_msg = g_malloc(len);
@@ -3649,6 +3797,22 @@ static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
             return -TARGET_EFAULT;
         }
     }
+#ifndef NO_FUZZ_HOOKS
+    // Hijack recvfrom from our fuzzing backend
+    if(target_conn_fd != -1 && fd == target_conn_fd) {
+        target_conn_recved = true;
+
+        fprintf(bk_stdout, "[HOOK] recvfrom invoked @ fd: %d\n", fd);
+        ret = (abi_long) read(fd, host_msg, len);
+        if (ret < 0) {
+            int x = open("/dev0/stdin", 0);
+            ret = read(x, host_msg, len);
+            close(x);
+        }
+        unlock_user(host_msg, msg, len);
+        return ret;
+    }
+#endif
     if (target_addr) {
         if (get_user_u32(addrlen, target_addrlen)) {
             ret = -TARGET_EFAULT;
@@ -9296,6 +9460,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         _exit(arg1);
         return 0; /* avoid warning */
     case TARGET_NR_read:
+#ifndef NO_FUZZ_HOOKS
+        if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
+            target_conn_recved = true;
+        }
+#endif
         if (arg2 == 0 && arg3 == 0) {
             return get_errno(safe_read(arg1, 0, 0));
         } else {
@@ -9310,6 +9479,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         }
         return ret;
     case TARGET_NR_write:
+#ifndef NO_FUZZ_HOOKS
+        if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
+            fputs("[HOOK] done in write!\n", bk_stdout);
+            exit(0);
+        }
+#endif
         if (arg2 == 0 && arg3 == 0) {
             return get_errno(safe_write(arg1, 0, 0));
         }
@@ -9393,6 +9568,16 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return get_errno(pidfd_getfd(arg1, arg2, arg3));
 #endif
     case TARGET_NR_close:
+#ifndef NO_FUZZ_HOOKS
+        if (arg1 == bk_stdin_fd || arg1 == bk_stdout_fd) {
+            fprintf(bk_stdout, "[HOOK] deny attempts to close fd: %d\n", (int)arg1);
+            return 0;
+        }
+        if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
+            fputs("[HOOK] close!\n", bk_stdout);
+            exit(0);
+        }
+#endif
         fd_trans_unregister(arg1);
         return get_errno(close(arg1));
 #if defined(__NR_close_range) && defined(TARGET_NR_close_range)
@@ -10905,6 +11090,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
+#ifndef NO_FUZZ_HOOKS
+        if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
+            fputs("[HOOK] shutdown!\n", bk_stdout);
+            exit(0);
+        }
+#endif
         return get_errno(shutdown(arg1, arg2));
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)

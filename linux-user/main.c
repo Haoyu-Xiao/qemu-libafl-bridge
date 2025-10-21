@@ -88,6 +88,14 @@ unsigned long mmap_min_addr;
 uintptr_t guest_base;
 bool have_guest_base;
 
+#ifndef NO_FUZZ_HOOKS
+int fuzz_port = -1;
+int bk_stdin_fd = -1;
+int bk_stdout_fd = -1;
+FILE *bk_stdin;
+FILE *bk_stdout;
+#endif
+
 /*
  * Used to implement backwards-compatibility for the `-strace`, and
  * QEMU_STRACE options. Without this, the QEMU_LOG can be overwritten by
@@ -474,6 +482,15 @@ static void handle_arg_jitdump(const char *arg)
     perf_enable_jitdump();
 }
 
+#ifndef NO_FUZZ_HOOKS
+static void handle_arg_fuzz_port(const char *arg)
+{
+    if (qemu_strtoi(arg, NULL, 10, &fuzz_port)) {
+        usage(EXIT_FAILURE);
+    }
+}
+#endif
+
 static QemuPluginList plugins = QTAILQ_HEAD_INITIALIZER(plugins);
 
 #ifdef CONFIG_PLUGIN
@@ -554,6 +571,10 @@ static const struct qemu_argument arg_table[] = {
      "",           "Generate a /tmp/perf-${pid}.map file for perf"},
     {"jitdump",    "QEMU_JITDUMP",     false, handle_arg_jitdump,
      "",           "Generate a jit-${pid}.dump file for perf"},
+#ifndef NO_FUZZ_HOOKS
+    {"fuzz-port",  "QEMU_FUZZ_PORT",   true, handle_arg_fuzz_port,
+     "port",       "set the fuzzing target port to 'port'"},
+#endif
     {NULL, NULL, false, NULL, NULL, NULL}
 };
 
@@ -1025,6 +1046,26 @@ int main(int argc, char **argv, char **envp)
     }
 
     g_free(target_environ);
+
+#ifndef NO_FUZZ_HOOKS
+    bk_stdin_fd = dup2(0, 1337);
+    bk_stdout_fd = dup2(1, 1338);
+    if(bk_stdin_fd < 0 || bk_stdout_fd < 0) {
+        puts("Error when backing up stdin and stdout");
+        _exit(EXIT_FAILURE);
+    }
+
+    bk_stdin = fdopen(bk_stdin_fd, "r");
+    bk_stdout = fdopen(bk_stdout_fd, "w");
+    setbuf(bk_stdin, NULL);
+    setbuf(bk_stdout, NULL);
+    if(bk_stdin == NULL || bk_stdout == NULL) {
+        puts("Error creating backup stdin and stdout file structs");
+        _exit(EXIT_FAILURE);
+    }
+    fprintf(stderr, "[HOOK] %d %d\n", bk_stdin_fd, bk_stdout_fd);
+    fprintf(bk_stdout, "[HOOK2] %d %d\n", bk_stdin_fd, bk_stdout_fd);
+#endif
 
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
         FILE *f = qemu_log_trylock();
