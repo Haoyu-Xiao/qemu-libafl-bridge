@@ -18,6 +18,7 @@ linux_user_ss.add(files(
   'strace.c',
   'syscall.c',
   'thunk.c',
+  'ioctl-compat.c',
   'uaccess.c',
   'uname.c',
 ))

@@ -110,7 +110,11 @@
 { TARGET_NR_close_range, "close_range" , "%s(%u,%u,%u)", NULL, NULL },
 #endif
 #ifdef TARGET_NR_connect
+#ifndef NO_EMU_HOOKS
+{ TARGET_NR_connect, "connect" , NULL, print_connect, NULL },
+#else
 { TARGET_NR_connect, "connect" , "%s(%d,%#x,%d)", NULL, NULL },
+#endif
 #endif
 #ifdef TARGET_NR_creat
 { TARGET_NR_creat, "creat" , NULL, print_creat, NULL },

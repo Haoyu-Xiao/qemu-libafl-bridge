@@ -79,7 +79,11 @@ char real_exec_path[PATH_MAX];
 static bool opt_one_insn_per_tb;
 static unsigned long opt_tb_size;
 static const char *argv0;
+#ifndef NO_EMU_HOOKS
+static char *gdbstub;
+#else
 static const char *gdbstub;
+#endif
 static envlist_t *envlist;
 static const char *cpu_model;
 static const char *cpu_type;
@@ -90,11 +94,75 @@ bool have_guest_base;
 
 #ifndef NO_FUZZ_HOOKS
 int fuzz_port = -1;
-int bk_stdin_fd = -1;
-int bk_stdout_fd = -1;
-FILE *bk_stdin;
-FILE *bk_stdout;
+int fuzz_input_fd = -1;
+FILE *fuzz_input = NULL;
 #endif
+
+#ifndef NO_EMU_HOOKS
+bool program_code_only = false;
+bool hackbind = false; // GREENHOUSE PATCH
+bool hackproc = false; // GREENHOUSE PATCH
+bool hacksysinfo = false; // GREENHOUSE PATCH
+int hackwrite_fd_count = 0; // HOUSEFUZZ PATCH
+int hackwrite_fds[MAX_HACKWRITE_FDS] = {0}; // HOUSEFUZZ PATCH
+static const char *gdb_target = NULL;
+char **hack_environ = NULL;
+
+char *qemu_execve_path;
+
+static void handle_arg_execve(const char *arg)
+{
+    qemu_execve_path = strdup(arg);
+}
+
+static void handle_arg_pconly(const char *arg)
+{
+    // Is not used in the codebase
+    program_code_only = 1;
+}
+
+static void handle_arg_hackbind(const char *arg)
+{
+    hackbind = true;
+}
+
+static void handle_arg_hackproc(const char *arg)
+{
+    hackproc = true;
+}
+
+static void handle_arg_hacksysinfo(const char *arg)
+{
+    hacksysinfo = true;
+}
+
+static void handle_arg_hackwrite(const char *arg)
+{
+    char * args = strdup(arg);
+    // use strtok to split the args by comma
+    char *token = strtok(args, ",");
+    while (token != NULL) {
+        // convert the token to an integer and store it in the array
+        int fd = atoi(token);
+        if (fd < 0) {
+            fprintf(stderr, "Invalid hackwrite fd %d\n", fd);
+            exit(EXIT_FAILURE);
+        }
+        if (hackwrite_fd_count >= MAX_HACKWRITE_FDS) {
+            fprintf(stderr, "Too many hackwrite fds specified\n");
+            exit(EXIT_FAILURE);
+        }
+        hackwrite_fds[hackwrite_fd_count++] = fd;
+        token = strtok(NULL, ",");
+    }
+}
+
+static void handle_arg_gdb_target(const char *arg)
+{
+    gdb_target = strdup(arg);
+}
+#endif // !NO_EMU_HOOKS
+
 
 /*
  * Used to implement backwards-compatibility for the `-strace`, and
@@ -489,6 +557,23 @@ static void handle_arg_fuzz_port(const char *arg)
         usage(EXIT_FAILURE);
     }
 }
+
+static void handle_arg_fuzz_input_fd(const char *arg)
+{
+    if (fuzz_input_fd != -1) {
+        fprintf(stderr, "Fuzz input fd already set to %d\n", fuzz_input_fd);
+        usage(EXIT_FAILURE);
+    }
+    if (qemu_strtoi(arg, NULL, 10, &fuzz_input_fd)) {
+        usage(EXIT_FAILURE);
+    }
+    fuzz_input = fdopen(fuzz_input_fd, "r");
+    if (fuzz_input == NULL) {
+        fprintf(stderr, "Error opening fuzz input from fd %d: %s\n", fuzz_input_fd, strerror(errno));
+        _exit(EXIT_FAILURE);
+    }
+    setbuf(fuzz_input, NULL);
+}
 #endif
 
 static QemuPluginList plugins = QTAILQ_HEAD_INITIALIZER(plugins);
@@ -572,8 +657,26 @@ static const struct qemu_argument arg_table[] = {
     {"jitdump",    "QEMU_JITDUMP",     false, handle_arg_jitdump,
      "",           "Generate a jit-${pid}.dump file for perf"},
 #ifndef NO_FUZZ_HOOKS
-    {"fuzz-port",  "QEMU_FUZZ_PORT",   true, handle_arg_fuzz_port,
-     "port",       "set the fuzzing target port to 'port'"},
+    {"fuzz-port",      "LIBAFL_QEMU_FUZZ_PORT",   true, handle_arg_fuzz_port,
+     "port",           "set the fuzzing target port to 'port'"},
+    {"fuzz-input-fd",  "LIBAFL_QEMU_FUZZ_INPUT_FD",    true, handle_arg_fuzz_input_fd,
+     "fd",             "set the fuzzing input fd to 'fd'"},
+#endif
+#ifndef NO_EMU_HOOKS
+    {"execve",     "QEMU_EXECVE",      true,   handle_arg_execve, // GREENHOUSE PATCH
+     "path",       "use interpreter at 'path' when a process calls execve()"},
+    {"pconly",     "QEMU_PCONLY",      false,   handle_arg_pconly, // GREENHOUSE PATCH
+     "",           "filter non-program code ranges when logging"},
+    {"hackbind",   "QEMU_HACKBIND",    false,   handle_arg_hackbind, // GREENHOUSE PATCH
+     "",           "use hack to get around ipv6 addrs and conflicting binds"},
+    {"hackproc",   "QEMU_HACKPROC",    false,   handle_arg_hackproc, // GREENHOUSE PATCH
+     "",           "use hack to get around needing to mount a writable /proc"},
+    {"hacksysinfo","QEMU_HACKSYSINFO", false,   handle_arg_hacksysinfo, // GREENHOUSE PATCH
+     "",           "use hack to get around sysinfo reporting"},
+    {"hackwrite",  "QEMU_HACKWRITE",   true,    handle_arg_hackwrite, // HOUSEFUZZ PATCH
+     "fd",         "dump output of given fd to log file"},
+    {"gdb-target", "QEMU_GDB_TARGET",  true,   handle_arg_gdb_target,
+     "name",       "only debug process with 'name'"},
 #endif
     {NULL, NULL, false, NULL, NULL, NULL}
 };
@@ -850,6 +953,9 @@ int main(int argc, char **argv, char **envp)
      * get binfmt_misc flags
      */
     preserve_argv0 = !!(qemu_getauxval(AT_FLAGS) & AT_FLAGS_PRESERVE_ARGV0);
+// #ifndef NO_EMU_HOOKS
+//     preserve_argv0 = 0; // XHY: Disable preserve_argv0
+// #endif
 
     /*
      * Manage binfmt-misc preserve-arg[0] flag
@@ -975,6 +1081,20 @@ int main(int argc, char **argv, char **envp)
     target_environ = envlist_to_environ(envlist, NULL);
     envlist_free(envlist);
 
+#ifndef NO_EMU_HOOKS
+    envlist = envlist_create();
+    for (wrk = environ; *wrk != NULL; wrk++) {
+        continue;
+    }
+    while (wrk != environ) {
+        wrk--;
+        if (strncmp(*wrk, "QEMU_", 5) == 0) {
+            (void) envlist_setenv(envlist, *wrk);
+        }
+    }
+    hack_environ = envlist_to_environ(envlist, NULL);
+#endif
+
     /*
      * Read in mmap_min_addr kernel parameter.  This value is used
      * When loading the ELF image to determine whether guest_base
@@ -1047,26 +1167,6 @@ int main(int argc, char **argv, char **envp)
 
     g_free(target_environ);
 
-#ifndef NO_FUZZ_HOOKS
-    bk_stdin_fd = dup2(0, 1337);
-    bk_stdout_fd = dup2(1, 1338);
-    if(bk_stdin_fd < 0 || bk_stdout_fd < 0) {
-        puts("Error when backing up stdin and stdout");
-        _exit(EXIT_FAILURE);
-    }
-
-    bk_stdin = fdopen(bk_stdin_fd, "r");
-    bk_stdout = fdopen(bk_stdout_fd, "w");
-    setbuf(bk_stdin, NULL);
-    setbuf(bk_stdout, NULL);
-    if(bk_stdin == NULL || bk_stdout == NULL) {
-        puts("Error creating backup stdin and stdout file structs");
-        _exit(EXIT_FAILURE);
-    }
-    fprintf(stderr, "[HOOK] %d %d\n", bk_stdin_fd, bk_stdout_fd);
-    fprintf(bk_stdout, "[HOOK2] %d %d\n", bk_stdin_fd, bk_stdout_fd);
-#endif
-
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
         FILE *f = qemu_log_trylock();
         if (f) {
@@ -1101,6 +1201,16 @@ int main(int argc, char **argv, char **envp)
     target_set_brk(info->brk);
     syscall_init();
     signal_init(rtsig_map);
+
+#ifndef NO_EMU_HOOKS
+    // GREENHOUSE PATCH
+    if (program_code_only == 1) {
+        char filter_buf[512]; //GREENHOUSE PATCH
+        memset(filter_buf, 0, 512);
+        snprintf(filter_buf, 512, "0x%lx..0x%lx", (unsigned long)info->start_code, (unsigned long)info->end_code);
+        qemu_set_dfilter_ranges(filter_buf, &error_fatal);
+    }
+#endif // !NO_EMU_HOOKS
 
     /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
        generating the prologue until now so that the prologue can take

@@ -1363,7 +1363,11 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
 
     if (handler == TARGET_SIG_DFL) {
         /* default handler : ignore some signal. The other are job control or fatal */
+#ifndef NO_EMU_HOOKS
+        if (sig == TARGET_SIGTSTP || sig == TARGET_SIGTTIN || sig == TARGET_SIGTTOU || sig == TARGET_SIGALRM) {
+#else
         if (sig == TARGET_SIGTSTP || sig == TARGET_SIGTTIN || sig == TARGET_SIGTTOU) {
+#endif
             kill(getpid(),SIGSTOP);
         } else if (sig != TARGET_SIGCHLD &&
                    sig != TARGET_SIGURG &&

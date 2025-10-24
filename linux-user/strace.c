@@ -390,6 +390,53 @@ print_sockaddr(abi_ulong addr, abi_long addrlen, int last)
             qemu_log("},");
             break;
         }
+#ifndef NO_EMU_HOOKS
+        case AF_INET6: {
+            struct target_sockaddr_in6 *in6 = (struct target_sockaddr_in6 *)sa;
+            uint8_t *c = (uint8_t *)&in6->sin6_addr;
+            qemu_log("{sin6_family=AF_INET6,sin6_port=htons(%d),",
+                     ntohs(in6->sin6_port));
+            // Check for IPv4-mapped IPv6 address
+            if (memcmp(c, "\0\0\0\0\0\0\0\0\0\0\0\0", 12) == 0) {
+                qemu_log("sin6_addr=inet_addr(\"%d.%d.%d.%d\")",
+                          c[0], c[1], c[2], c[3]);
+            } else {
+                // Iterating over hextets to find the largest sequence of zeros
+                char tmp[INET6_ADDRSTRLEN], *p;
+                int largest = -1, length = 0, current = -1, clength = 0;
+                for (i = 0; i < 8; i++) {
+                    if (c[i*2] == 0 && c[i*2+1] == 0) {
+                        if (current == -1) {
+                            current = i; clength = 1;
+                        } else {
+                            clength++;
+                        }
+                    } else {
+                        if (current != -1 && clength > length) {
+                            largest = current; length = clength;
+                        }
+                        current = -1; clength = 0;
+                    }
+                }
+                if (current != -1 && clength > length) {
+                    largest = current; length = clength;
+                }
+                p = tmp;
+                for (i = 0; i < 8; i++) {
+                    if (i == largest) {
+                        *p++ = ':'; *p++ = ':';
+                        i += length - 1;
+                        continue;
+                    }
+                    if (i != 0) *p++ = ':';
+                    p += sprintf(p, "%x", (c[i*2] << 8) | c[i*2+1]);
+                }
+                qemu_log("sin6_addr=inet_addr(\"%s\")", tmp);
+            }
+            qemu_log("}");
+            break;
+        }
+#endif
         case AF_PACKET: {
             struct target_sockaddr_ll *ll = (struct target_sockaddr_ll *)sa;
             uint8_t *c = (uint8_t *)&ll->sll_addr;
@@ -3220,6 +3267,21 @@ print_sendto(CPUArchState *cpu_env, const struct syscallname *name,
 }
 #endif
 
+#ifndef NO_EMU_HOOKS
+#if defined(TARGET_NR_connect)
+static void
+print_connect(CPUArchState *cpu_env, const struct syscallname *name,
+              abi_long arg0, abi_long arg1, abi_long arg2,
+              abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    print_syscall_prologue(name);
+    print_sockfd(arg0, 0);
+    print_sockaddr(arg1, arg2, 1);
+    print_syscall_epilogue(name);
+}
+#endif
+#endif // NO_EMU_HOOKS
+
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_stat64) || \
     defined(TARGET_NR_lstat) || defined(TARGET_NR_lstat64)
 static void
@@ -4401,7 +4463,7 @@ print_syscall(CPUArchState *cpu_env, int num,
     if (!f) {
         return;
     }
-    fprintf(f, "%d ", get_task_state(env_cpu(cpu_env))->ts_tid);
+    fprintf(f, "%d ", gettid());
 
     for (i = 0; i < nsyscalls; i++) {
         if (scnames[i].nr == num) {

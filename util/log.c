@@ -48,6 +48,41 @@ int qemu_loglevel;
 static bool log_per_thread;
 static GArray *debug_regions;
 
+#ifndef NO_EMU_HOOKS
+
+static int prev_thread_id = 0;
+
+int qemu_log_fd(void)
+{
+    FILE *logfile;
+    if (log_per_thread) {
+        logfile = thread_file;
+    } else {
+        logfile = qatomic_read(&global_file);
+    }
+    if (!logfile) {
+        return -1;
+    }
+    return fileno(logfile);
+}
+
+#define THREAD_LOG_FD_START 0x0060
+#define THREAD_LOG_FD_END 0x0100
+
+static int qemu_find_log_thread_fd(void)
+{
+    int log_thread_fd;
+
+    for (log_thread_fd = THREAD_LOG_FD_START; log_thread_fd != THREAD_LOG_FD_END; ++log_thread_fd) {
+        if (fcntl(log_thread_fd, F_GETFD) == -1 && errno == EBADF) {
+            return log_thread_fd;
+        }
+    }
+    return -1;
+}
+
+#endif // !NO_EMU_HOOKS
+
 /* Returns true if qemu_log() will really write somewhere. */
 bool qemu_log_enabled(void)
 {
@@ -90,19 +125,44 @@ static void qemu_log_thread_cleanup(Notifier *n, void *unused)
 static FILE *qemu_log_trylock_with_err(Error **errp)
 {
     FILE *logfile;
+#ifndef NO_EMU_HOOKS
+    int old_logfd;
+    int new_logfd;
+#endif
+
+    // Make sure logs are saved into correponding log file
+    if (prev_thread_id && prev_thread_id != log_thread_id()) {
+        if (thread_file) {
+            fclose(thread_file);
+        }
+        thread_file = NULL;
+    }
 
     logfile = thread_file;
     if (!logfile) {
         if (log_per_thread) {
             g_autofree char *filename
                 = g_strdup_printf(global_filename, log_thread_id());
-            logfile = fopen(filename, "w");
+            logfile = fopen(filename, "a");
             if (!logfile) {
                 error_setg_errno(errp, errno,
                                  "Error opening logfile %s for thread %d",
                                  filename, log_thread_id());
                 return NULL;
             }
+            chmod(filename, 0666);
+#ifndef NO_EMU_HOOKS
+            prev_thread_id = log_thread_id();
+            QEMU_LOCK_GUARD(&global_mutex);
+            new_logfd = qemu_find_log_thread_fd();
+            if (new_logfd >= 0) {
+                old_logfd = fileno(logfile);
+                if (dup2(old_logfd, new_logfd) != -1) {
+                    fclose(logfile);
+                    logfile = fdopen(new_logfd, "a");
+                }
+            }
+#endif // !NO_EMU_HOOKS
             thread_file = logfile;
             qemu_log_thread_cleanup_notifier.notify = qemu_log_thread_cleanup;
             qemu_thread_atexit_add(&qemu_log_thread_cleanup_notifier);
@@ -276,6 +336,9 @@ static bool qemu_set_log_internal(const char *filename, bool changed_name,
     qemu_loglevel = log_flags;
 
     daemonized = is_daemonized();
+#ifndef NO_EMU_HOOKS
+    daemonized = false;
+#endif
     need_to_open_file = false;
     if (!daemonized) {
         /*

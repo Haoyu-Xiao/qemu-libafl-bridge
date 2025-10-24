@@ -379,6 +379,30 @@ const argtype *thunk_print(void *arg, const argtype *type_ptr)
                 qemu_log("[");
             }
 
+#ifndef NO_EMU_HOOKS
+            if (!is_string) {
+                for (i = 0; i < array_length; i++) {
+                    if (i > 0) {
+                        qemu_log(",");
+                    }
+                    thunk_print(a, type_ptr);
+                    a += arg_size;
+                }
+            } else {
+                for (i = 0; i < array_length; i++) {
+                    char c = *(char *)a;
+                    if (c == '"' || c == '\\') {
+                        qemu_log("\\");
+                    } else if ((c >= 0 && c < 32) || c >= 0x7f) {
+                        qemu_log("\\x%02x", (unsigned char)c);
+                        a++;
+                        continue;
+                    }
+                    qemu_log("%c", c);
+                    a++;
+                }
+            }
+#else
             for (i = 0; i < array_length; i++) {
                 if (i > 0 && !is_string) {
                     qemu_log(",");
@@ -387,6 +411,7 @@ const argtype *thunk_print(void *arg, const argtype *type_ptr)
                 a += arg_size;
             }
 
+#endif // !NO_EMU_HOOKS
             if (is_string) {
                 qemu_log("\"");
             } else {

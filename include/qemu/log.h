@@ -96,4 +96,8 @@ int qemu_str_to_log_mask(const char *str);
  */
 void qemu_print_log_usage(FILE *f);
 
+#ifndef NO_EMU_HOOKs
+int qemu_log_fd(void);
+#endif // !NO_EMU_HOOKs
+
 #endif

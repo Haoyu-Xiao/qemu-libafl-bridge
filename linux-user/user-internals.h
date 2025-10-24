@@ -28,6 +28,16 @@ void task_settid(TaskState *);
 void stop_all_tasks(void);
 extern const char *qemu_uname_release;
 extern unsigned long mmap_min_addr;
+#ifndef NO_EMU_HOOKS
+extern char *qemu_execve_path; // GREENHOUSE_PATCH
+extern bool hackbind; // GREENHOUSE_PATCH
+extern bool hackproc; // GREENHOUSE_PATCH
+extern bool hacksysinfo; // GREENHOUSE_PATCH
+#define MAX_HACKWRITE_FDS 0x20
+extern int hackwrite_fd_count;
+extern int hackwrite_fds[MAX_HACKWRITE_FDS];
+extern char **hack_environ;
+#endif
 
 typedef struct IOCTLEntry IOCTLEntry;
 

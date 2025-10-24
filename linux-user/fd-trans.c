@@ -332,6 +332,14 @@ enum {
     QEMU__IFLA_VF_MAX,
 };
 
+#ifndef NO_EMU_HOOKS
+
+unsigned int target_fd_dev_info_max;
+TargetFdDevInfo *target_fd_dev_info;
+QemuMutex target_fd_dev_info_lock;
+
+#endif // !NO_EMU_HOOKS
+
 TargetFdTrans **target_fd_trans;
 QemuMutex target_fd_trans_lock;
 unsigned int target_fd_max;

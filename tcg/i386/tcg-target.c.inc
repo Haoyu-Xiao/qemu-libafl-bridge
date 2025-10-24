@@ -2137,6 +2137,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     h->base = addr;
     h->aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN, s_bits == MO_128);
     a_mask = (1 << h->aa.align) - 1;
+#ifndef NO_EMU_HOOKS
+    a_mask = 0;
+#endif
 
     if (tcg_use_softmmu) {
         int cmp_ofs = is_ld ? offsetof(CPUTLBEntry, addr_read)
