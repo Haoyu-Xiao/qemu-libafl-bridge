@@ -683,35 +683,33 @@ static int mkdir_p(const char *path, mode_t mode) {
 }
 
 static void *house_path_translate(char* pathname, char* redirected_path, int create) {
-    char rpath[PATH_MAX - 2];
+    char rpath[PATH_MAX];
 
-    if (hackproc) {
+    memset(rpath, 0, sizeof(rpath));
+    if (NULL == realpath(pathname, rpath)) {
         memset(rpath, 0, sizeof(rpath));
-        if (NULL == realpath(pathname, rpath)) {
-            memset(rpath, 0, sizeof(rpath));
-            snprintf(rpath, sizeof(rpath)-1, "%s", pathname);
-        }
+        snprintf(rpath, sizeof(rpath)-1, "%s", pathname);
+    }
 
-        if (strncmp(rpath, "/proc/", 6) == 0) {
-            snprintf(redirected_path, PATH_MAX, "/proc0/%s", rpath+6);
-            if (create) {
-                // make sure the directory exists
-                char *p = strrchr(redirected_path, '/');
-                if (p) {
-                    *p = 0;
-                    mkdir_p(redirected_path, 0755); // ignore error
-                    *p = '/';
-                }
-                return redirected_path;
+    if (strncmp(rpath, "/proc/", 6) == 0) {
+        snprintf(redirected_path, PATH_MAX + 2, "/proc0/%s", rpath+6);
+        if (create) {
+            // make sure the directory exists
+            char *p = strrchr(redirected_path, '/');
+            if (p) {
+                *p = 0;
+                mkdir_p(redirected_path, 0755); // ignore error
+                *p = '/';
             }
-            if (access(redirected_path, F_OK) == 0) {
-                return redirected_path;
-            }
-        } else if (strncmp(rpath, "/dev/", 5) == 0) {
-            snprintf(redirected_path, PATH_MAX, "/dev0/%s", rpath+5);
-            if (access(redirected_path, F_OK) == 0) {
-                return redirected_path;
-            }
+            return redirected_path;
+        }
+        if (access(redirected_path, F_OK) == 0) {
+            return redirected_path;
+        }
+    } else if (strncmp(rpath, "/dev/", 5) == 0) {
+        snprintf(redirected_path, PATH_MAX + 2, "/dev0/%s", rpath+5);
+        if (access(redirected_path, F_OK) == 0) {
+            return redirected_path;
         }
     }
     return pathname;
@@ -908,12 +906,61 @@ safe_syscall4(int, fchmodat2, int, dfd, const char *, filename,
 #endif
 
 #ifndef NO_FUZZ_HOOKS
-static bool target_conn_recved = false;
-static int target_conn_fd = -1;
-static int target_sock_fd = -1;
+#define FUZZ_INPUT_BUF_SIZE (1 * 1024 * 1024) /* 1 MB */
+
 extern int fuzz_port;
-extern int fuzz_input_fd;
-extern FILE *fuzz_input;
+static abi_long fuzz_input_addr = 0x1F77000;
+
+static int fuzz_input_fd = -1;
+static int target_conn_fd = -1;
+static bool target_conn_recved = false;
+static bool target_sock_polled = false;
+static int target_sock_fd = -1;
+
+// Load input to a memfd and return the fd
+static inline int setup_fuzz_input_fd(void) {
+    // Setup shared memory for fuzzing input
+    // fprintf(stderr, "Setting up fuzzing input shared memory...\n");
+    int sv[2];
+    if (target_conn_fd >= 0) {
+        close(target_conn_fd);
+        close(fuzz_input_fd);
+    }
+
+    // Use socketpair instead of pipe to bypass socket checks
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) != 0) {
+        perror("setup_fuzz_input_fd -> socketpair");
+        return -1;
+    }
+
+    int input_size;
+    if (get_user_u32(input_size, fuzz_input_addr) != 0) {
+        perror("[HOOK] setup_fuzz_input_fd -> get_user_u32");
+        return -1;
+    }
+
+    void *src = lock_user(VERIFY_READ, fuzz_input_addr + 4, input_size, 1);
+    if (src == NULL) {
+        perror("[HOOK] setup_fuzz_input_fd -> lock_user");
+        return -1;
+    }
+
+    ssize_t written = safe_write(sv[1], src, input_size);
+    unlock_user(src, fuzz_input_addr, 0);
+    if (written < 0) {
+        perror("[HOOK] setup_fuzz_input_fd -> safe_write");
+        return -1;
+    }
+    if (written != input_size) {
+        fprintf(stderr, "[HOOK] setup_fuzz_input_fd -> safe_write: written %zd bytes, expected %d bytes. Still continue\n",
+                written, input_size);
+    }
+
+    
+    target_conn_fd = sv[0];
+    fuzz_input_fd = sv[1];
+    return target_conn_fd;
+}
 #endif
 
 static inline int host_to_target_sock_type(int host_type)
@@ -1475,16 +1522,15 @@ static abi_long do_select(int n,
 
 #ifndef NO_FUZZ_HOOKS
     ret = 0;
-    if (target_sock_fd >= 0) {
-        for (int i = 0; i < n; ++i) {
-            if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
-                fprintf(stderr, "[HOOK] select invoked on target socket\n");
-                ret = target_sock_fd + 1;
-                memset(&rfds, 0, sizeof(rfds));
-                memset(&wfds, 0, sizeof(wfds));
-                memset(&efds, 0, sizeof(efds));
-                FD_SET(target_sock_fd, &rfds);
-            }
+    if (!target_sock_polled && target_sock_fd >= 0) {
+        if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
+            target_sock_polled = true;
+            fprintf(stderr, "[HOOK] select invoked on target socket\n");
+            memset(&rfds, 0, sizeof(rfds));
+            memset(&wfds, 0, sizeof(wfds));
+            memset(&efds, 0, sizeof(efds));
+            FD_SET(target_sock_fd, &rfds);
+            ret = target_sock_fd + 1;
         }
     }
     if (!ret) {
@@ -1623,16 +1669,15 @@ static abi_long do_pselect6(abi_long arg1, abi_long arg2, abi_long arg3,
 
 #ifndef NO_FUZZ_HOOKS
     ret = 0;
-    if (target_sock_fd >= 0) {
-        for (int i = 0; i < n; ++i) {
-            if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
-                fprintf(stderr, "[HOOK] select invoked on target socket\n");
-                ret = target_sock_fd + 1;
-                memset(&rfds, 0, sizeof(rfds));
-                memset(&wfds, 0, sizeof(wfds));
-                memset(&efds, 0, sizeof(efds));
-                FD_SET(target_sock_fd, &rfds);
-            }
+    if (!target_sock_polled && target_sock_fd >= 0) {
+        if (rfd_addr && FD_ISSET(target_sock_fd, &rfds)) {
+            target_sock_polled = true;
+            fprintf(stderr, "[HOOK] select invoked on target socket\n");
+            ret = target_sock_fd + 1;
+            memset(&rfds, 0, sizeof(rfds));
+            memset(&wfds, 0, sizeof(wfds));
+            memset(&efds, 0, sizeof(efds));
+            FD_SET(target_sock_fd, &rfds);
         }
     }
     if (!ret) {
@@ -1731,22 +1776,22 @@ static abi_long do_ppoll(abi_long arg1, abi_long arg2, abi_long arg3,
 
 #ifndef NO_FUZZ_HOOKS
         for (i = 0; i < nfds; i++) {
-            if (target_sock_fd >= 0 && pfd[i].fd == target_sock_fd) {
+            if (!target_sock_polled && target_sock_fd >= 0 && pfd[i].fd == target_sock_fd) {
+                target_sock_polled = true;
                 fprintf(stderr, "[HOOK] poll invoked on target socket\n");
+
+                pfd[i].revents = tswap16(POLLIN);
                 for (i = 0; i < nfds; i++) {
-                    if (pfd[i].fd == target_sock_fd) {
-                        pfd[i].revents = tswap16(POLLIN);
-                    } else {
+                    if (pfd[i].fd != target_sock_fd) {
                         pfd[i].revents = 0;
                     }
                 }
                 return 1;
             }
         }
-#else
+#endif
         ret = get_errno(safe_ppoll(pfd, nfds, timeout_ts,
                                    set, SIGSET_T_SIZE));
-#endif
         if (set) {
             finish_sigsuspend_mask(ret);
         }
@@ -1877,18 +1922,6 @@ static inline abi_long target_to_host_sockaddr(int fd, struct sockaddr *addr,
         in6addr = (struct sockaddr_in6 *)addr;
         in6addr->sin6_scope_id = tswap32(in6addr->sin6_scope_id);
     }
-#ifndef NO_FUZZ_HOOKS
-    if (sa_family == AF_INET) {
-        struct sockaddr_in *inaddr;
-        int port;
-
-        inaddr = (struct sockaddr_in *)addr;
-        port = ntohs(inaddr->sin_port);
-        if (fuzz_port > 0 && fuzz_port == port) {
-            target_sock_fd = fd;
-        }
-    }
-#endif
     unlock_user(target_saddr, target_addr, 0);
 
     return 0;
@@ -2295,6 +2328,13 @@ static abi_long do_setsockopt(int sockfd, int level, int optname,
 {
     abi_long ret;
     int val;
+
+// #ifndef NO_FUZZ_HOOKS
+//     if(sockfd == target_conn_fd) {
+//         fputs("[HOOK] hook setsockopt\n", stderr);
+//         return 0;
+//     }
+// #endif
 
     switch(level) {
     case SOL_TCP:
@@ -2779,12 +2819,12 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
     int len, val;
     socklen_t lv;
 
-#ifndef NO_FUZZ_HOOKS
-    if(sockfd == target_conn_fd) {
-        fputs("[HOOK] hook getsockopt\n", stderr);
-        return 0;
-    }
-#endif
+// #ifndef NO_FUZZ_HOOKS
+//     if(sockfd == target_conn_fd) {
+//         fputs("[HOOK] hook getsockopt\n", stderr);
+//         return 0;
+//     }
+// #endif
 
     switch(level) {
     case TARGET_SOL_SOCKET:
@@ -3487,6 +3527,21 @@ static abi_long do_bind(int sockfd, abi_ulong target_addr,
     /* GREENHOUSE PATCH */
     family = ((struct sockaddr*)addr)->sa_family;
 
+#ifndef NO_FUZZ_HOOKS
+    if (family == AF_INET) {
+        struct sockaddr_in *inaddr;
+
+        inaddr = (struct sockaddr_in *)addr;
+        fprintf(stderr, "[HOOK] bind to %s:%hu\n",
+                inet_ntoa(inaddr->sin_addr),
+                ntohs(inaddr->sin_port));
+        if (target_sock_fd <= 0 && fuzz_port > 0 && fuzz_port == ntohs(inaddr->sin_port)) {
+            fprintf(stderr, "[HOOK] sock_fd=%d matched fuzz port\n", sockfd);
+            target_sock_fd = sockfd;
+        }
+    }
+#endif
+
     if (hackbind && family == AF_INET) {
         inet_ntop(AF_INET, &((struct sockaddr_in*)addr)->sin_addr, ip, sizeof(ip));
         port = ntohs(((struct sockaddr_in*)addr)->sin_port);
@@ -3814,36 +3869,35 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
 
 #ifndef NO_FUZZ_HOOKS
     // Hijack accepted connection to our fuzzing backend
-    struct sockaddr_in sin;
-    socklen_t len = sizeof(sin);
-    if (!getsockname(fd, (struct sockaddr *)&sin, &len)) {
-        if (ntohs(sin.sin_port) == fuzz_port) {
-            target_conn_fd = dup(fuzz_input_fd);
-            if (target_conn_fd < 0) {
-                return -TARGET_EMFILE;
-            }
-            fprintf(stderr, "[HOOK] accept sock fd: %d\n", target_conn_fd);
-            if (target_conn_recved) {
-                fputs("[HOOK] done!\n", stderr);
-                exit(0);
-            }
+    if (fd == target_sock_fd) {
+        // Load input data from memfd
+        target_conn_fd = setup_fuzz_input_fd();
+        if (target_conn_fd < 0) {
+            fputs("[HOOK] failed to setup fuzz input fd\n", stderr);
+            return -TARGET_EFAULT;
+        }
+
+        fprintf(stderr, "[HOOK] accept sockfd=%d, connfd=%d\n", target_sock_fd, target_conn_fd);
+        if (target_conn_recved) {
+            fputs("[HOOK] done!\n", stderr);
+            exit(0);
         }
 
         // Fake connection source to bypass checks
-        if (!get_user_u32(addrlen, target_addrlen_addr)) {
-            close(target_conn_fd);
-            return -TARGET_EFAULT;
+        if (target_addr != 0) {
+            if (get_user_u32(addrlen, target_addrlen_addr)) {
+                return -TARGET_EFAULT;
+            }
+            struct sockaddr_in saddr = {0};
+            saddr.sin_family = AF_INET;
+            saddr.sin_port = htons(4444);
+            inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+            host_to_target_sockaddr(target_addr, (void *)&saddr, addrlen);
+            if (put_user_u32(addrlen, target_addrlen_addr)) {
+                return -TARGET_EFAULT;
+            }
         }
-        struct sockaddr_in saddr = {0};
-        saddr.sin_family = AF_INET;
-        saddr.sin_port = htons(4444);
-        inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
-        host_to_target_sockaddr(target_addr, (void *)&saddr, addrlen);
-        if (put_user_u32(addrlen, target_addrlen_addr)) {
-            close(target_conn_fd);
-            return -TARGET_EFAULT;
-        }
-        
+
         return target_conn_fd;
     }
 #endif
@@ -9999,7 +10053,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
     void *p, *p0;
 #ifndef NO_EMU_HOOKS
-    char redirected_path[PATH_MAX+1];
+    char redirected_path[PATH_MAX+3];
     memset(redirected_path, 0, sizeof(redirected_path));
 #endif
 
@@ -10048,6 +10102,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_read:
 #ifndef NO_FUZZ_HOOKS
         if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
+            fprintf(stderr, "[HOOK] read invoked @ fd %d!\n", (int) arg1);
             target_conn_recved = true;
         }
 #endif
@@ -10185,10 +10240,6 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
     case TARGET_NR_close:
 #ifndef NO_FUZZ_HOOKS
-        if (fuzz_input_fd >= 0 && arg1 == fuzz_input_fd) {
-            fprintf(stderr, "[HOOK] deny attempts to close fd: %d\n", (int)arg1);
-            return 0;
-        }
         if (target_conn_fd >= 0 && arg1 == target_conn_fd) {
             fputs("[HOOK] close!\n", stderr);
             exit(0);

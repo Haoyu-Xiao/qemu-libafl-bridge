@@ -94,8 +94,6 @@ bool have_guest_base;
 
 #ifndef NO_FUZZ_HOOKS
 int fuzz_port = -1;
-int fuzz_input_fd = -1;
-FILE *fuzz_input = NULL;
 #endif
 
 #ifndef NO_EMU_HOOKS
@@ -553,26 +551,13 @@ static void handle_arg_jitdump(const char *arg)
 #ifndef NO_FUZZ_HOOKS
 static void handle_arg_fuzz_port(const char *arg)
 {
+    if (fuzz_port != -1) {
+        fprintf(stderr, "Fuzz port already specified\n");
+        usage(EXIT_FAILURE);
+    }
     if (qemu_strtoi(arg, NULL, 10, &fuzz_port)) {
         usage(EXIT_FAILURE);
     }
-}
-
-static void handle_arg_fuzz_input_fd(const char *arg)
-{
-    if (fuzz_input_fd != -1) {
-        fprintf(stderr, "Fuzz input fd already set to %d\n", fuzz_input_fd);
-        usage(EXIT_FAILURE);
-    }
-    if (qemu_strtoi(arg, NULL, 10, &fuzz_input_fd)) {
-        usage(EXIT_FAILURE);
-    }
-    fuzz_input = fdopen(fuzz_input_fd, "r");
-    if (fuzz_input == NULL) {
-        fprintf(stderr, "Error opening fuzz input from fd %d: %s\n", fuzz_input_fd, strerror(errno));
-        _exit(EXIT_FAILURE);
-    }
-    setbuf(fuzz_input, NULL);
 }
 #endif
 
@@ -657,10 +642,8 @@ static const struct qemu_argument arg_table[] = {
     {"jitdump",    "QEMU_JITDUMP",     false, handle_arg_jitdump,
      "",           "Generate a jit-${pid}.dump file for perf"},
 #ifndef NO_FUZZ_HOOKS
-    {"fuzz-port",      "LIBAFL_QEMU_FUZZ_PORT",   true, handle_arg_fuzz_port,
-     "port",           "set the fuzzing target port to 'port'"},
-    {"fuzz-input-fd",  "LIBAFL_QEMU_FUZZ_INPUT_FD",    true, handle_arg_fuzz_input_fd,
-     "fd",             "set the fuzzing input fd to 'fd'"},
+    {"fuzz-port",  "LIBAFL_QEMU_FUZZ_PORT",   true,  handle_arg_fuzz_port,
+     "port",       "target port to fuzzing"},
 #endif
 #ifndef NO_EMU_HOOKS
     {"execve",     "QEMU_EXECVE",      true,   handle_arg_execve, // GREENHOUSE PATCH
@@ -953,9 +936,6 @@ int main(int argc, char **argv, char **envp)
      * get binfmt_misc flags
      */
     preserve_argv0 = !!(qemu_getauxval(AT_FLAGS) & AT_FLAGS_PRESERVE_ARGV0);
-// #ifndef NO_EMU_HOOKS
-//     preserve_argv0 = 0; // XHY: Disable preserve_argv0
-// #endif
 
     /*
      * Manage binfmt-misc preserve-arg[0] flag
