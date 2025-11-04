@@ -50,6 +50,7 @@
      ((dir)  << HOST_IOC_DIRSHIFT))
 
 #define host_ioc_dir(cmd)   (((cmd) >> HOST_IOC_DIRSHIFT) & (HOST_IOC_WRITE | HOST_IOC_READ))
+#define host_ioc_size(cmd)  (((cmd) >> HOST_IOC_SIZESHIFT) & HOST_IOC_SIZEMASK)
 
 static inline bool ioctl_cmd_may_conflict(int cmd) {
     return !(cmd & (~HOST_IOC_NRMASK));
@@ -96,7 +97,7 @@ static inline int ioctl_cmd_trans(int cmd) {
         return cmd;
     }
     int new_cmd = (cmd & ((1 << TARGET_IOC_SIZESHIFT) - 1)) | \
-        ((((cmd >> TARGET_IOC_SIZESHIFT) & TARGET_IOC_SIZEMASK & HOST_IOC_SIZEMASK) << HOST_IOC_SIZESHIFT)) | \
+        ((((cmd >> TARGET_IOC_SIZESHIFT) & TARGET_IOC_SIZEMASK) << HOST_IOC_SIZESHIFT) & HOST_IOC_SIZEMASK) | \
         (dir << HOST_IOC_DIRSHIFT);
     // fprintf(stderr, "ioctl cmd %x -> %x\n", cmd, new_cmd);
     return new_cmd;
