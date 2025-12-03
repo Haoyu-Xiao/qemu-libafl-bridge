@@ -97,7 +97,7 @@ static inline int ioctl_cmd_trans(int cmd) {
         return cmd;
     }
     int new_cmd = (cmd & ((1 << TARGET_IOC_SIZESHIFT) - 1)) | \
-        ((((cmd >> TARGET_IOC_SIZESHIFT) & TARGET_IOC_SIZEMASK) << HOST_IOC_SIZESHIFT) & HOST_IOC_SIZEMASK) | \
+        ((((cmd >> TARGET_IOC_SIZESHIFT) & TARGET_IOC_SIZEMASK) & HOST_IOC_SIZEMASK) << HOST_IOC_SIZESHIFT) | \
         (dir << HOST_IOC_DIRSHIFT);
     // fprintf(stderr, "ioctl cmd %x -> %x\n", cmd, new_cmd);
     return new_cmd;

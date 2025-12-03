@@ -691,8 +691,16 @@ static void *house_path_translate(char* pathname, char* redirected_path, int cre
         snprintf(rpath, sizeof(rpath)-1, "%s", pathname);
     }
 
-    if (strncmp(rpath, "/proc/", 6) == 0) {
-        snprintf(redirected_path, PATH_MAX + 2, "/proc0/%s", rpath+6);
+    bool is_proc = !strncmp(rpath, "/proc/", 6);
+    bool is_sys = !is_proc && !strncmp(rpath, "/sys/", 5);
+    bool is_dev = !is_proc && !is_sys && !strncmp(rpath, "/dev/", 5);
+    
+    if (is_proc || is_sys) {
+        if (is_proc) {
+            snprintf(redirected_path, PATH_MAX + 2, "/proc0/%s", rpath+6);
+        } else {
+            snprintf(redirected_path, PATH_MAX + 2, "/sys0/%s", rpath+5);
+        }
         if (create) {
             // make sure the directory exists
             char *p = strrchr(redirected_path, '/');
@@ -706,8 +714,12 @@ static void *house_path_translate(char* pathname, char* redirected_path, int cre
         if (access(redirected_path, F_OK) == 0) {
             return redirected_path;
         }
-    } else if (strncmp(rpath, "/dev/", 5) == 0) {
-        snprintf(redirected_path, PATH_MAX + 2, "/dev0/%s", rpath+5);
+    } else if (is_dev) {
+        if (strcmp(rpath, "/dev/console") == 0 && \
+            readlink("/proc/self/fd/0", redirected_path, PATH_MAX + 2) == 0) {
+        } else {
+            snprintf(redirected_path, PATH_MAX + 2, "/dev0/%s", rpath+5);
+        }
         if (access(redirected_path, F_OK) == 0) {
             return redirected_path;
         }
