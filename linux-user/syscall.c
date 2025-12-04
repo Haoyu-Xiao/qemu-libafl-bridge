@@ -9497,6 +9497,14 @@ static int do_execv(CPUArchState *cpu_env, int dirfd,
         goto execve_efault;
     }
 
+#ifndef NO_EMU_HOOKS
+    char redirected_path[PATH_MAX+3];
+    void *p0;
+    memset(redirected_path, 0, sizeof(redirected_path));
+    p0 = p;
+    p = house_path_translate(p, redirected_path, 0);
+#endif
+
     const char *exe = p;
     if (is_proc_myself(p, "exe")) {
         exe = exec_path;
@@ -9512,6 +9520,7 @@ static int do_execv(CPUArchState *cpu_env, int dirfd,
             ? safe_execveat(dirfd, exe, argp, envp, flags)
             : safe_execve(exe, argp, envp);
     }
+    p = p0; // restore original pointer for unlock
 #else
     ret = is_execveat
         ? safe_execveat(dirfd, exe, argp, envp, flags)
